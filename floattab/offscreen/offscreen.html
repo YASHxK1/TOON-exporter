@@ -1,0 +1,16 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>FloatTab Offscreen</title>
+    <style>
+      body { margin: 0; background: #000; overflow: hidden; }
+      video { width: 1px; height: 1px; position: absolute; top: -9999px; left: -9999px; opacity: 0; }
+    </style>
+  </head>
+  <body>
+    <!-- Hidden video element used as the source for requestPictureInPicture() -->
+    <video id="floattab-capture-video" muted playsinline></video>
+    <script src="offscreen.js"></script>
+  </body>
+</html>

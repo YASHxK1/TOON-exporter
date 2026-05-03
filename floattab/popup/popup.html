@@ -1,0 +1,275 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>FloatTab</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap"
+      rel="stylesheet"
+    />
+    <style>
+      /* ---------------------------------------------------------------
+         Reset & base
+      --------------------------------------------------------------- */
+      *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+      body {
+        width: 320px;
+        min-height: 180px;
+        background: #0f0f12;
+        color: #e8e8f0;
+        font-family: 'Inter', system-ui, sans-serif;
+        font-size: 14px;
+        overflow: hidden;
+        user-select: none;
+      }
+
+      /* ---------------------------------------------------------------
+         Container
+      --------------------------------------------------------------- */
+      .container {
+        padding: 20px 20px 18px;
+        display: flex;
+        flex-direction: column;
+        gap: 16px;
+      }
+
+      /* ---------------------------------------------------------------
+         Header
+      --------------------------------------------------------------- */
+      .header {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+      }
+
+      .logo {
+        width: 28px;
+        height: 28px;
+        border-radius: 7px;
+        background: linear-gradient(135deg, #3b82f6 0%, #6366f1 100%);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        flex-shrink: 0;
+        box-shadow: 0 2px 8px rgba(99, 102, 241, 0.4);
+      }
+
+      .logo svg { width: 15px; height: 15px; }
+
+      .brand {
+        display: flex;
+        flex-direction: column;
+        gap: 1px;
+      }
+
+      .brand-name {
+        font-size: 15px;
+        font-weight: 700;
+        letter-spacing: -0.3px;
+        color: #f0f0ff;
+        line-height: 1;
+      }
+
+      .brand-tagline {
+        font-size: 10px;
+        color: #6b6b80;
+        letter-spacing: 0.2px;
+      }
+
+      /* ---------------------------------------------------------------
+         Main toggle button
+      --------------------------------------------------------------- */
+      .pip-btn {
+        width: 100%;
+        padding: 13px 16px;
+        border: none;
+        border-radius: 12px;
+        cursor: pointer;
+        font-family: inherit;
+        font-size: 14px;
+        font-weight: 600;
+        letter-spacing: -0.1px;
+        transition: all 0.18s ease;
+        position: relative;
+        overflow: hidden;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 8px;
+        outline: none;
+      }
+
+      /* Shimmer effect layer */
+      .pip-btn::before {
+        content: '';
+        position: absolute;
+        inset: 0;
+        background: linear-gradient(90deg, transparent, rgba(255,255,255,0.06), transparent);
+        transform: translateX(-100%);
+        transition: transform 0.4s ease;
+      }
+
+      .pip-btn:hover::before { transform: translateX(100%); }
+
+      /* Inactive state */
+      .pip-btn.inactive {
+        background: linear-gradient(135deg, #3b82f6 0%, #6366f1 100%);
+        color: #fff;
+        box-shadow: 0 4px 16px rgba(99, 102, 241, 0.35);
+      }
+
+      .pip-btn.inactive:hover {
+        transform: translateY(-1px);
+        box-shadow: 0 6px 20px rgba(99, 102, 241, 0.5);
+      }
+
+      .pip-btn.inactive:active { transform: translateY(0px); }
+
+      /* Active state */
+      .pip-btn.active {
+        background: linear-gradient(135deg, #ef4444 0%, #dc2626 100%);
+        color: #fff;
+        box-shadow: 0 4px 16px rgba(239, 68, 68, 0.35);
+      }
+
+      .pip-btn.active:hover {
+        transform: translateY(-1px);
+        box-shadow: 0 6px 20px rgba(239, 68, 68, 0.5);
+      }
+
+      .pip-btn.active:active { transform: translateY(0px); }
+
+      /* Disabled / restricted state */
+      .pip-btn.disabled {
+        background: #1e1e26;
+        color: #55556a;
+        cursor: not-allowed;
+        box-shadow: none;
+        border: 1px solid #2a2a36;
+      }
+
+      .pip-btn.disabled:hover { transform: none; }
+
+      /* Button icon */
+      .pip-btn svg { width: 16px; height: 16px; flex-shrink: 0; }
+
+      /* ---------------------------------------------------------------
+         Status bar
+      --------------------------------------------------------------- */
+      .status-bar {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 10px 12px;
+        background: #161620;
+        border-radius: 9px;
+        border: 1px solid #222230;
+      }
+
+      /* Status dot */
+      .status-dot {
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        flex-shrink: 0;
+        transition: background 0.3s ease, box-shadow 0.3s ease;
+      }
+
+      .status-dot.inactive  { background: #404055; }
+      .status-dot.interactive {
+        background: #22c55e;
+        box-shadow: 0 0 6px rgba(34, 197, 94, 0.7);
+        animation: pulse-green 2s infinite;
+      }
+      .status-dot.mirror {
+        background: #eab308;
+        box-shadow: 0 0 6px rgba(234, 179, 8, 0.7);
+        animation: pulse-yellow 2s infinite;
+      }
+      .status-dot.error {
+        background: #ef4444;
+        box-shadow: 0 0 6px rgba(239, 68, 68, 0.7);
+      }
+
+      @keyframes pulse-green {
+        0%, 100% { box-shadow: 0 0 4px rgba(34, 197, 94, 0.5); }
+        50%       { box-shadow: 0 0 10px rgba(34, 197, 94, 0.9); }
+      }
+      @keyframes pulse-yellow {
+        0%, 100% { box-shadow: 0 0 4px rgba(234, 179, 8, 0.5); }
+        50%       { box-shadow: 0 0 10px rgba(234, 179, 8, 0.9); }
+      }
+
+      /* Status text */
+      .status-text {
+        font-size: 12px;
+        color: #8888a0;
+        line-height: 1.3;
+        flex: 1;
+      }
+
+      .status-text strong { color: #b0b0c8; font-weight: 500; }
+
+      /* ---------------------------------------------------------------
+         Divider
+      --------------------------------------------------------------- */
+      .divider {
+        height: 1px;
+        background: #1c1c28;
+        margin: 0 -20px;
+      }
+
+      /* ---------------------------------------------------------------
+         Footer
+      --------------------------------------------------------------- */
+      .footer {
+        font-size: 10px;
+        color: #3a3a50;
+        text-align: center;
+        letter-spacing: 0.2px;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <!-- Header -->
+      <div class="header">
+        <div class="logo">
+          <svg viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg">
+            <rect x="1" y="4" width="12" height="10" rx="2" fill="white" fill-opacity="0.9"/>
+            <rect x="9" y="9" width="10" height="8" rx="2" fill="white" fill-opacity="0.5" stroke="white" stroke-width="0.5"/>
+          </svg>
+        </div>
+        <div class="brand">
+          <span class="brand-name">FloatTab</span>
+          <span class="brand-tagline">Picture-in-Picture for any site</span>
+        </div>
+      </div>
+
+      <!-- Main toggle button -->
+      <button id="pip-btn" class="pip-btn inactive" aria-label="Float this tab in Picture-in-Picture">
+        <svg viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg" id="btn-icon">
+          <rect x="1" y="4" width="12" height="10" rx="2" fill="currentColor" fill-opacity="0.9"/>
+          <rect x="9" y="9" width="10" height="8" rx="2" fill="currentColor" fill-opacity="0.5" stroke="currentColor" stroke-width="0.8"/>
+        </svg>
+        <span id="btn-label">Float This Tab</span>
+      </button>
+
+      <!-- Status bar -->
+      <div class="status-bar" role="status" aria-live="polite">
+        <div class="status-dot inactive" id="status-dot"></div>
+        <div class="status-text" id="status-text">Inactive — click to open a floating window</div>
+      </div>
+
+      <div class="divider"></div>
+
+      <div class="footer">FloatTab v1.0 · Chrome 116+</div>
+    </div>
+
+    <script src="popup.js"></script>
+  </body>
+</html>
