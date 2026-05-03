@@ -1,0 +1,38 @@
+{
+  "manifest_version": 3,
+  "name": "TOON Exporter",
+  "version": "2.0.0",
+  "description": "Select any content on any website and convert it to TOON (Token-Oriented Object Notation) format. Full chat export on ChatGPT & Claude.",
+  "permissions": [
+    "activeTab",
+    "storage",
+    "scripting",
+    "contextMenus"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "background": {
+    "service_worker": "background.js"
+  }
+}
