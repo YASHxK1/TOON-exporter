@@ -1,62 +1,47 @@
-/**
- * content.js — FloatTab Content Script
- *
- * Injected into every tab. Responsibilities:
- * - Listen for INJECT_DOC_PIP from the service worker
- * - Open a Document PiP window using the Document Picture-in-Picture API
- * - Inject an iframe pointing to the current page URL into that window
- * - Copy host stylesheets into the PiP document for visual consistency
- * - If the iframe fails to load (CSP / X-Frame-Options at runtime), signal the
- *   service worker to fall back to mirror mode
- * - Listen for CLOSE_DOC_PIP to programmatically close the window
- * - Detect when the user closes the PiP window natively and sync popup state
- */
-
 (function () {
   "use strict";
 
-  // Prevent multiple injections — if we already set up the listener, bail out
   if (window.__floatTabInitialized) return;
   window.__floatTabInitialized = true;
 
-  // Expose a global entry point so popup.js can trigger PiP via
-  // chrome.scripting.executeScript(), which preserves the user gesture context
-  // far more reliably than the SW message chain.
-  window.__floatTabOpen = () => openDocumentPiP();
-  window.__floatTabClose = () => closeDocumentPiP();
-
-  /** Reference to the currently open Document PiP window (if any) */
   let pipWindow = null;
-
-  /** Whether we have already triggered a fallback for this PiP session */
+  let sessionMode = null;
   let fallbackTriggered = false;
+  let suppressNextPagehideMessage = false;
+  let mirrorSession = null;
 
-  // ---------------------------------------------------------------------------
-  // Message listener
-  // ---------------------------------------------------------------------------
+  window.__floatTabOpen = () => openDocumentPiP();
+  window.__floatTabOpenMirror = (streamId) => openMirrorPiP(streamId);
+  window.__floatTabClose = () => {
+    closeActivePiP({ notify: false });
+    return { success: true };
+  };
 
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     if (message.type === "INJECT_DOC_PIP") {
-      // Kick off PiP asynchronously; we must respond promptly
       openDocumentPiP()
         .then((result) => sendResponse(result))
         .catch((err) => sendResponse({ success: false, error: err.message }));
-      return true; // Keep channel open for async response
+      return true;
     }
 
-    if (message.type === "CLOSE_DOC_PIP") {
-      closeDocumentPiP();
+    if (message.type === "START_MIRROR_DOC_PIP") {
+      openMirrorPiP(message.streamId, {
+        reuseExistingWindow: Boolean(message.reuseExistingWindow),
+      })
+        .then((result) => sendResponse(result))
+        .catch((err) => sendResponse({ success: false, error: err.message }));
+      return true;
+    }
+
+    if (message.type === "CLOSE_DOC_PIP" || message.type === "CLOSE_TAB_PIP") {
+      closeActivePiP({ notify: false });
       sendResponse({ success: true });
       return false;
     }
   });
 
-  // ---------------------------------------------------------------------------
-  // Open Document PiP window
-  // ---------------------------------------------------------------------------
-
   async function openDocumentPiP() {
-    // Guard: Document PiP API availability (Chrome 116+)
     if (!("documentPictureInPicture" in window)) {
       return {
         success: false,
@@ -64,123 +49,331 @@
       };
     }
 
-    // Close any existing PiP window before opening a new one
-    if (pipWindow && !pipWindow.closed) {
-      pipWindow.close();
-    }
-
     fallbackTriggered = false;
 
+    let nextWindow;
     try {
-      // Request the Document PiP window.
-      // IMPORTANT: This call must happen synchronously within a user gesture chain.
-      // The popup button click → chrome.runtime.sendMessage → onMessage handler →
-      // content.js message handler → this function.  MV3 preserves the user gesture
-      // context through synchronous message forwarding, so requestWindow() is valid here.
-      // Landscape 16:9 dimensions as required by spec
-      pipWindow = await window.documentPictureInPicture.requestWindow({
-        width: 854,
-        height: 480,
-      });
+      nextWindow = await ensurePipWindow({ reuseExistingWindow: false });
     } catch (err) {
-      // requestWindow can fail if: no user gesture, Chrome < 116, or API removed
       return { success: false, error: `requestWindow failed: ${err.message}` };
     }
 
-    // Style the PiP window's body — full-screen, no margins
-    const pipDoc = pipWindow.document;
-    pipDoc.documentElement.style.cssText = "margin:0;padding:0;width:100%;height:100%;";
-    pipDoc.body.style.cssText = "margin:0;padding:0;width:100%;height:100%;overflow:hidden;background:#000;position:relative;";
+    sessionMode = "interactive";
+    cleanupMirrorSession();
 
-    // Copy all stylesheets from the host document into the PiP document.
-    // This ensures any chrome-global or extension styles are available, and
-    // provides visual continuity for the floating window chrome.
+    const pipDoc = nextWindow.document;
     copyStylesheets(document, pipDoc);
+    const body = resetPipDocument(pipDoc);
 
-    // Inject an iframe pointing to the current page URL.
-    // Use position:absolute + inset:0 so it always fills the entire PiP window
-    // regardless of the window's own sizing quirks.
     const iframe = pipDoc.createElement("iframe");
     iframe.src = window.location.href;
-    iframe.style.cssText = "position:absolute;top:0;left:0;width:100%;height:100%;border:none;display:block;";
     iframe.id = "floattab-iframe";
+    iframe.style.cssText =
+      "position:absolute;inset:0;width:100%;height:100%;border:none;display:block;background:#fff;";
 
-    // Detect iframe load failure (CSP / X-Frame-Options runtime block)
-    iframe.addEventListener("error", handleIframeError);
+    iframe.addEventListener("error", () => {
+      void handleIframeError();
+    });
 
-    // The 'load' event fires even when embedding is blocked (the browser shows
-    // an error page inside the iframe).  We use a heuristic: if the iframe's
-    // contentDocument is null after load, the site blocked embedding.
     iframe.addEventListener("load", () => {
+      if (sessionMode !== "interactive" || fallbackTriggered) {
+        return;
+      }
+
       try {
-        // Cross-origin access to contentDocument will throw if blocked
         const doc = iframe.contentDocument;
         if (!doc || doc.body === null) {
-          handleIframeError();
+          void handleIframeError();
         }
       } catch (_) {
-        // Security error → cross-origin, which is expected and fine.
-        // The iframe loaded successfully into its sandboxed origin.
+        // Cross-origin access throws here for healthy embeds; ignore it.
       }
     });
 
-    pipDoc.body.appendChild(iframe);
-
-    // Listen for the user closing the PiP window via the native close button (×)
-    pipWindow.addEventListener("pagehide", () => {
-      pipWindow = null;
-      // Notify the service worker so it can reset popup state
-      chrome.runtime.sendMessage({ type: "PIP_CLOSED_BY_USER" }).catch(() => {});
-    });
+    body.appendChild(iframe);
 
     return { success: true, mode: "interactive" };
   }
 
-  // ---------------------------------------------------------------------------
-  // Iframe error → fallback to mirror mode
-  // ---------------------------------------------------------------------------
+  async function openMirrorPiP(streamId, options = {}) {
+    if (!("documentPictureInPicture" in window)) {
+      return {
+        success: false,
+        error: "DOC_PIP_UNSUPPORTED",
+      };
+    }
 
-  function handleIframeError() {
-    if (fallbackTriggered) return;
-    fallbackTriggered = true;
+    const { reuseExistingWindow = false } = options;
+    fallbackTriggered = false;
 
-    // Close the Document PiP window (it was showing a broken/empty iframe)
-    if (pipWindow && !pipWindow.closed) {
-      pipWindow.close();
+    let nextWindow;
+    try {
+      nextWindow = await ensurePipWindow({ reuseExistingWindow });
+    } catch (err) {
+      return { success: false, error: `requestWindow failed: ${err.message}` };
+    }
+
+    sessionMode = "mirror";
+    cleanupMirrorSession();
+    renderLoadingState("Starting view-only mode...");
+
+    let stream;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({
+        video: {
+          mandatory: {
+            chromeMediaSource: "tab",
+            chromeMediaSourceId: streamId,
+          },
+        },
+        audio: false,
+      });
+    } catch (err) {
+      closeActivePiP({ notify: false });
+      return { success: false, error: err.message };
+    }
+
+    if (!pipWindow || pipWindow.closed || pipWindow !== nextWindow) {
+      stream.getTracks().forEach((track) => track.stop());
+      return {
+        success: false,
+        error: "Mirror window closed before capture could start",
+      };
+    }
+
+    const body = resetPipDocument(nextWindow.document);
+    const video = nextWindow.document.createElement("video");
+    video.autoplay = true;
+    video.muted = true;
+    video.playsInline = true;
+    video.controls = false;
+    video.style.cssText =
+      "width:100%;height:100%;display:block;object-fit:contain;background:#000;";
+    video.srcObject = stream;
+    body.appendChild(video);
+
+    try {
+      await video.play();
+    } catch (err) {
+      stream.getTracks().forEach((track) => track.stop());
+      closeActivePiP({ notify: false });
+      return { success: false, error: err.message };
+    }
+
+    const track = stream.getVideoTracks()[0];
+    const onTrackEnded = () => {
+      if (sessionMode !== "mirror") {
+        return;
+      }
+
+      chrome.runtime.sendMessage({ type: "MIRROR_PIP_ENDED" }).catch(() => {});
+      closeActivePiP({ notify: false });
+    };
+
+    if (track) {
+      track.addEventListener("ended", onTrackEnded, { once: true });
+    }
+
+    const drmTimer = setTimeout(() => {
+      if (
+        mirrorSession &&
+        mirrorSession.video === video &&
+        video.readyState === HTMLMediaElement.HAVE_NOTHING
+      ) {
+        chrome.runtime
+          .sendMessage({ type: "MIRROR_PIP_DRM_DETECTED" })
+          .catch(() => {});
+      }
+    }, 3000);
+
+    mirrorSession = {
+      stream,
+      video,
+      drmTimer,
+      onTrackEnded,
+    };
+
+    return { success: true, mode: "mirror" };
+  }
+
+  async function ensurePipWindow(options = {}) {
+    const { reuseExistingWindow = false } = options;
+
+    if (!("documentPictureInPicture" in window)) {
+      throw new Error("DOC_PIP_UNSUPPORTED");
+    }
+
+    if (pipWindow && pipWindow.closed) {
       pipWindow = null;
     }
 
-    // Signal service worker to fall back to mirror mode
-    chrome.runtime
-      .sendMessage({ type: "PIP_FALLBACK_TO_MIRROR" })
-      .catch((err) => console.warn("[FloatTab] Fallback message failed:", err));
-  }
-
-  // ---------------------------------------------------------------------------
-  // Close Document PiP (called by service worker on CLOSE_PIP)
-  // ---------------------------------------------------------------------------
-
-  function closeDocumentPiP() {
-    if (pipWindow && !pipWindow.closed) {
-      pipWindow.close();
+    if (reuseExistingWindow && pipWindow && !pipWindow.closed) {
+      primePipWindow(pipWindow);
+      return pipWindow;
     }
-    pipWindow = null;
-    fallbackTriggered = false;
+
+    if (pipWindow && !pipWindow.closed) {
+      suppressNextPagehideMessage = true;
+      sessionMode = null;
+      fallbackTriggered = false;
+      cleanupMirrorSession();
+
+      const previousWindow = pipWindow;
+      pipWindow = null;
+      previousWindow.close();
+    }
+
+    const nextWindow = await window.documentPictureInPicture.requestWindow({
+      width: 854,
+      height: 480,
+    });
+
+    pipWindow = nextWindow;
+    primePipWindow(nextWindow);
+
+    return nextWindow;
   }
 
-  // ---------------------------------------------------------------------------
-  // Stylesheet copying
-  // ---------------------------------------------------------------------------
+  function primePipWindow(nextWindow) {
+    const pipDoc = nextWindow.document;
+    pipDoc.documentElement.style.cssText =
+      "margin:0;padding:0;width:100%;height:100%;";
+    pipDoc.body.style.cssText =
+      "margin:0;padding:0;width:100%;height:100%;overflow:hidden;background:#000;position:relative;";
 
-  /**
-   * Copies all <link rel="stylesheet"> and <style> elements from the source
-   * document into the target document (the PiP window document).
-   * This gives the PiP window chrome (scrollbars, font rendering) the same
-   * base styles as the host page, improving visual consistency.
-   *
-   * @param {Document} sourceDoc - The host page document
-   * @param {Document} targetDoc - The PiP window document
-   */
+    if (nextWindow.__floatTabBound) {
+      return;
+    }
+
+    nextWindow.__floatTabBound = true;
+    nextWindow.addEventListener(
+      "pagehide",
+      () => {
+        handlePipWindowPagehide(nextWindow);
+      },
+      { once: true }
+    );
+  }
+
+  function handlePipWindowPagehide(closedWindow) {
+    const shouldNotify = !suppressNextPagehideMessage;
+    suppressNextPagehideMessage = false;
+
+    cleanupMirrorSession();
+
+    if (pipWindow === closedWindow) {
+      pipWindow = null;
+    }
+
+    sessionMode = null;
+    fallbackTriggered = false;
+
+    if (shouldNotify) {
+      chrome.runtime.sendMessage({ type: "PIP_CLOSED_BY_USER" }).catch(() => {});
+    }
+  }
+
+  function resetPipDocument(pipDoc) {
+    pipDoc.documentElement.style.cssText =
+      "margin:0;padding:0;width:100%;height:100%;";
+    pipDoc.body.style.cssText =
+      "margin:0;padding:0;width:100%;height:100%;overflow:hidden;background:#000;position:relative;";
+    pipDoc.body.replaceChildren();
+    return pipDoc.body;
+  }
+
+  function renderLoadingState(message) {
+    if (!pipWindow || pipWindow.closed) {
+      return;
+    }
+
+    const body = resetPipDocument(pipWindow.document);
+    const status = pipWindow.document.createElement("div");
+    status.textContent = message;
+    status.style.cssText =
+      "position:absolute;inset:0;display:flex;align-items:center;justify-content:center;padding:24px;color:#e5e7eb;font:600 16px/1.4 system-ui,sans-serif;text-align:center;background:radial-gradient(circle at top, rgba(59,130,246,0.28), transparent 55%), #05070b;";
+    body.appendChild(status);
+  }
+
+  async function handleIframeError() {
+    if (sessionMode !== "interactive" || fallbackTriggered) {
+      return;
+    }
+
+    fallbackTriggered = true;
+    renderLoadingState("This site blocks embedding. Switching to view-only mode...");
+
+    try {
+      const response = await chrome.runtime.sendMessage({
+        type: "PIP_FALLBACK_TO_MIRROR",
+      });
+
+      if (!response?.success) {
+        throw new Error(response?.error || "Mirror fallback failed");
+      }
+
+      if (response.host === "offscreen") {
+        closeActivePiP({ notify: false });
+      }
+    } catch (err) {
+      console.warn("[FloatTab] Mirror fallback failed:", err);
+      closeActivePiP();
+    }
+  }
+
+  function closeActivePiP(options = {}) {
+    const { notify = true } = options;
+    const currentWindow = pipWindow;
+
+    if (!notify) {
+      suppressNextPagehideMessage = true;
+    }
+
+    fallbackTriggered = false;
+    sessionMode = null;
+    cleanupMirrorSession();
+
+    if (currentWindow && !currentWindow.closed) {
+      pipWindow = null;
+      currentWindow.close();
+      return;
+    }
+
+    pipWindow = null;
+    suppressNextPagehideMessage = false;
+
+    if (notify) {
+      chrome.runtime.sendMessage({ type: "PIP_CLOSED_BY_USER" }).catch(() => {});
+    }
+  }
+
+  function cleanupMirrorSession(options = {}) {
+    const { stopTracks = true } = options;
+
+    if (!mirrorSession) {
+      return;
+    }
+
+    const { stream, video, drmTimer, onTrackEnded } = mirrorSession;
+    clearTimeout(drmTimer);
+
+    const track = stream.getVideoTracks()[0];
+    if (track && onTrackEnded) {
+      track.removeEventListener("ended", onTrackEnded);
+    }
+
+    if (stopTracks) {
+      stream.getTracks().forEach((mediaTrack) => mediaTrack.stop());
+    }
+
+    if (video) {
+      video.srcObject = null;
+      video.remove();
+    }
+
+    mirrorSession = null;
+  }
+
   function copyStylesheets(sourceDoc, targetDoc) {
     const elements = [
       ...sourceDoc.querySelectorAll('link[rel="stylesheet"], style'),
@@ -191,7 +384,6 @@
         const clone = targetDoc.importNode(el, true);
         targetDoc.head.appendChild(clone);
       } catch (err) {
-        // Cross-origin stylesheets may throw on importNode — skip them
         console.warn("[FloatTab] Could not copy stylesheet:", err);
       }
     }

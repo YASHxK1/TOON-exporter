@@ -1,12 +1,13 @@
 /**
- * service_worker.js — FloatTab Central Orchestrator
+ * service_worker.js — FloatTab Central Orchestrator (v2.0)
  *
  * Responsibilities:
  * - Listen for OPEN_PIP / CLOSE_PIP messages from popup.js
  * - Check if the active tab's URL is embeddable (no X-Frame-Options / restrictive CSP)
- * - Route to Mode A (interactive iframe via content.js) or Mode B (tab capture via offscreen.js)
- * - Manage the offscreen document lifecycle (MV3: only one per extension, must be reused)
- * - Maintain pip state per tab
+ * - Route to Mode A (interactive iframe via content.js) or Mode B (mirror mode)
+ * - Prefer tab-hosted Document PiP mirror mode for secure origins
+ * - Fall back to the shared offscreen document for insecure-origin mirror tabs
+ * - Maintain pip state PER TAB via pipRegistry (supports unlimited concurrent PiP windows)
  */
 
 // ---------------------------------------------------------------------------
@@ -14,15 +15,16 @@
 // ---------------------------------------------------------------------------
 
 /**
- * pipState holds the current PiP status for the extension.
- * Only one PiP window is supported at a time in v1.0.
- * @type {{ active: boolean, mode: 'interactive'|'mirror'|null, tabId: number|null }}
+ * pipRegistry holds the current PiP status for EVERY floated tab independently.
+ * Key: tabId (number)
+ * Value: { mode: 'interactive'|'mirror', host: 'tab'|'offscreen' }
+ *
+ * v2.0 replaces the single `pipState` object with this Map so that any number
+ * of tabs can be floated simultaneously.
+ *
+ * @type {Map<number, { mode: 'interactive'|'mirror', host: 'tab'|'offscreen' }>}
  */
-let pipState = {
-  active: false,
-  mode: null,
-  tabId: null,
-};
+const pipRegistry = new Map();
 
 /** Tracks whether an offscreen document has been created already */
 let offscreenCreated = false;
@@ -63,14 +65,43 @@ chrome.webRequest.onHeadersReceived.addListener(
   ["responseHeaders"]
 );
 
-// Clean up header cache when a tab is removed
+// Clean up when a tab is removed
 chrome.tabs.onRemoved.addListener((tabId) => {
   headerCache.delete(tabId);
-  // If the closed tab had an active PiP, reset state
-  if (pipState.tabId === tabId) {
-    resetPipState();
+
+  // If the removed tab had an active PiP session, clean it up
+  if (pipRegistry.has(tabId)) {
+    const session = pipRegistry.get(tabId);
+
+    // Stop only legacy offscreen mirror sessions explicitly.
+    // Tab-hosted Document PiP windows close automatically with their opener tab.
+    if (session.mode === "mirror" && session.host === "offscreen") {
+      chrome.runtime
+        .sendMessage({ type: "STOP_MIRROR_PIP", tabId })
+        .catch(() => {});
+    }
+
+    pipRegistry.delete(tabId);
+    updateBadge();
+
+    // Close offscreen document if no mirror sessions remain
+    maybeCloseOffscreen();
   }
 });
+
+// ---------------------------------------------------------------------------
+// Badge management (shows count of currently-floating tabs on the toolbar icon)
+// ---------------------------------------------------------------------------
+
+function updateBadge() {
+  const count = pipRegistry.size;
+  if (count === 0) {
+    chrome.action.setBadgeText({ text: "" });
+  } else {
+    chrome.action.setBadgeText({ text: String(count) });
+    chrome.action.setBadgeBackgroundColor({ color: "#6366f1" });
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Embeddability check
@@ -146,6 +177,35 @@ function isRestrictedUrl(url) {
   );
 }
 
+/**
+ * Returns true when the tab itself can safely consume a tab-capture stream ID.
+ * Chrome requires a secure origin for consumerTabId-based stream consumption.
+ *
+ * @param {string} url
+ * @returns {boolean}
+ */
+function isSecureMirrorConsumerUrl(url) {
+  try {
+    const parsed = new URL(url);
+
+    if (parsed.protocol === "https:") {
+      return true;
+    }
+
+    if (parsed.protocol !== "http:") {
+      return false;
+    }
+
+    return (
+      parsed.hostname === "localhost" ||
+      parsed.hostname === "127.0.0.1" ||
+      parsed.hostname === "[::1]"
+    );
+  } catch (_) {
+    return false;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Offscreen document management
 // ---------------------------------------------------------------------------
@@ -170,7 +230,7 @@ async function ensureOffscreenDocument() {
   await chrome.offscreen.createDocument({
     url: chrome.runtime.getURL("offscreen/offscreen.html"),
     reasons: ["USER_MEDIA"],
-    justification: "Capture tab video stream for mirror-mode PiP window",
+    justification: "Capture tab video streams for mirror-mode PiP windows",
   });
 
   offscreenCreated = true;
@@ -189,12 +249,17 @@ async function closeOffscreenDocument() {
   offscreenCreated = false;
 }
 
-// ---------------------------------------------------------------------------
-// PiP state helpers
-// ---------------------------------------------------------------------------
-
-function resetPipState() {
-  pipState = { active: false, mode: null, tabId: null };
+/**
+ * Closes the offscreen document only when no mirror-mode sessions remain.
+ * Called after removing a tab from the registry.
+ */
+async function maybeCloseOffscreen() {
+  const hasMirrorSessions = [...pipRegistry.values()].some(
+    (s) => s.mode === "mirror" && s.host === "offscreen"
+  );
+  if (!hasMirrorSessions) {
+    await closeOffscreenDocument();
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -205,16 +270,43 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   (async () => {
     switch (message.type) {
 
+      // -----------------------------------------------------------------------
       // Popup queries embeddability synchronously from cached headers
+      // -----------------------------------------------------------------------
       case "CHECK_EMBEDDABLE": {
         const embeddable = isEmbeddable(message.url || "", message.tabId);
         sendResponse({ embeddable });
         break;
       }
 
-      // Popup uses executeScript for interactive mode; SW only handles mirror
+      // -----------------------------------------------------------------------
+      // GET_PIP_STATE — now tab-scoped. Returns state for a specific tab.
+      // -----------------------------------------------------------------------
+      case "GET_PIP_STATE": {
+        const tabId = message.tabId;
+        const session = tabId !== undefined ? pipRegistry.get(tabId) : null;
+        sendResponse({
+          success: true,
+          pipState: session
+            ? { active: true, mode: session.mode, tabId }
+            : { active: false, mode: null, tabId: tabId ?? null },
+        });
+        break;
+      }
+
+      // -----------------------------------------------------------------------
+      // GET_ALL_PIP_COUNT — returns count of all active PiP sessions.
+      // Used by popup to show the "N tabs floating" badge.
+      // -----------------------------------------------------------------------
+      case "GET_ALL_PIP_COUNT": {
+        sendResponse({ success: true, count: pipRegistry.size });
+        break;
+      }
+
+      // -----------------------------------------------------------------------
+      // Popup uses executeScript for interactive mode; SW handles mirror only
+      // -----------------------------------------------------------------------
       case "OPEN_MIRROR_PIP": {
-        // We need a tab object — get it from the provided tabId
         try {
           const tab = await chrome.tabs.get(message.tabId);
           await startMirrorMode(tab, sendResponse);
@@ -224,35 +316,83 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         break;
       }
 
+      // -----------------------------------------------------------------------
       // Popup notifies SW of state after executeScript-based interactive open
-      case "SET_PIP_STATE":
-        pipState = { active: true, mode: message.mode, tabId: message.tabId };
+      // -----------------------------------------------------------------------
+      case "SET_PIP_STATE": {
+        const { tabId, mode, host = "tab" } = message;
+        pipRegistry.set(tabId, { mode, host });
+        updateBadge();
         sendResponse({ success: true });
         break;
+      }
 
-      case "CLOSE_PIP":
-        await handleClosePip(sendResponse);
+      // -----------------------------------------------------------------------
+      // CLOSE_PIP — now tab-scoped. Closes only the specified tab's PiP.
+      // -----------------------------------------------------------------------
+      case "CLOSE_PIP": {
+        await handleClosePip(message.tabId, sendResponse);
         break;
+      }
 
-      case "GET_PIP_STATE":
-        sendResponse({ success: true, pipState });
-        break;
-
+      // -----------------------------------------------------------------------
       // content.js signals iframe blocked — fall back to mirror
+      // sender.tab.id identifies which tab triggered the fallback
+      // -----------------------------------------------------------------------
       case "PIP_FALLBACK_TO_MIRROR":
         await handleFallbackToMirror(sender.tab, sendResponse);
         break;
 
-      case "PIP_CLOSED_BY_USER":
-        resetPipState();
+      // -----------------------------------------------------------------------
+      // content.js: user closed the Document PiP window natively
+      // sender.tab.id tells us which tab's PiP was closed
+      // -----------------------------------------------------------------------
+      case "PIP_CLOSED_BY_USER": {
+        const closedTabId = sender.tab?.id;
+        if (closedTabId !== undefined) {
+          pipRegistry.delete(closedTabId);
+          updateBadge();
+        }
         sendResponse({ success: true });
         break;
+      }
 
-      case "MIRROR_PIP_ENDED":
-        resetPipState();
-        await closeOffscreenDocument();
+      // -----------------------------------------------------------------------
+      // offscreen.js: a mirror PiP window was closed or stream ended
+      // message.tabId tells us which tab's session ended
+      // -----------------------------------------------------------------------
+      case "MIRROR_PIP_ENDED": {
+        const endedTabId = message.tabId ?? sender.tab?.id;
+        if (endedTabId !== undefined) {
+          pipRegistry.delete(endedTabId);
+          updateBadge();
+        }
+        await maybeCloseOffscreen();
         sendResponse({ success: true });
         break;
+      }
+
+      // -----------------------------------------------------------------------
+      // offscreen.js: DRM protection detected on a specific mirror tab
+      // -----------------------------------------------------------------------
+      case "MIRROR_PIP_DRM_DETECTED": {
+        if (!message.forwarded) {
+          const drmTabId = message.tabId ?? sender.tab?.id;
+          if (drmTabId !== undefined) {
+            chrome.runtime
+              .sendMessage({
+                type: "MIRROR_PIP_DRM_DETECTED",
+                tabId: drmTabId,
+                forwarded: true,
+              })
+              .catch(() => {});
+          }
+        }
+        // The popup for the affected tab will receive this and render DRM state.
+        // No registry change needed here — popup handles its own UI.
+        sendResponse({ success: true });
+        break;
+      }
 
       default:
         sendResponse({ success: false, error: "Unknown message type" });
@@ -263,27 +403,37 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 });
 
 // ---------------------------------------------------------------------------
-// CLOSE_PIP handler
+// CLOSE_PIP handler — closes only the specified tab's PiP
 // ---------------------------------------------------------------------------
 
-async function handleClosePip(sendResponse) {
+async function handleClosePip(tabId, sendResponse) {
   try {
-    if (pipState.mode === "interactive" && pipState.tabId !== null) {
-      // Tell content.js to close the PiP window
+    const session = pipRegistry.get(tabId);
+
+    if (!session) {
+      // Nothing to close — respond as success
+      sendResponse({ success: true });
+      return;
+    }
+
+    if (session.host === "tab") {
+      // Interactive mode and secure-origin mirror mode both live in content.js.
       try {
-        await chrome.tabs.sendMessage(pipState.tabId, { type: "CLOSE_DOC_PIP" });
+        await chrome.tabs.sendMessage(tabId, { type: "CLOSE_TAB_PIP" });
       } catch (_) {
         // Tab may have navigated — ignore
       }
-    } else if (pipState.mode === "mirror") {
-      // Tell offscreen.js to stop the capture
+    } else if (session.mode === "mirror") {
+      // Tell offscreen.js to stop this specific tab's capture
       try {
-        await chrome.runtime.sendMessage({ type: "STOP_MIRROR_PIP" });
+        await chrome.runtime.sendMessage({ type: "STOP_MIRROR_PIP", tabId });
       } catch (_) {}
-      await closeOffscreenDocument();
     }
 
-    resetPipState();
+    pipRegistry.delete(tabId);
+    updateBadge();
+    await maybeCloseOffscreen();
+
     sendResponse({ success: true });
   } catch (err) {
     console.error("[FloatTab SW] handleClosePip error:", err);
@@ -300,42 +450,105 @@ async function handleFallbackToMirror(tab, sendResponse) {
     sendResponse({ success: false, error: "No tab info in fallback" });
     return;
   }
-  await startMirrorMode(tab, sendResponse);
+
+  try {
+    if (isSecureMirrorConsumerUrl(tab.url || "")) {
+      const streamId = await getMirrorStreamId(tab.id, tab.id);
+
+      const response = await chrome.tabs.sendMessage(tab.id, {
+        type: "START_MIRROR_DOC_PIP",
+        streamId,
+        reuseExistingWindow: true,
+      });
+
+      if (!response?.success) {
+        throw new Error(response?.error || "Mirror fallback failed");
+      }
+
+      pipRegistry.set(tab.id, { mode: "mirror", host: "tab" });
+      updateBadge();
+
+      sendResponse({ success: true, host: "tab" });
+      return;
+    }
+
+    await startMirrorMode(tab, sendResponse);
+  } catch (err) {
+    console.error("[FloatTab SW] handleFallbackToMirror error:", err);
+    sendResponse({ success: false, error: err.message });
+  }
 }
 
 // ---------------------------------------------------------------------------
-// Mirror mode startup
+// Mirror mode startup — per-tab
 // ---------------------------------------------------------------------------
+
+async function getMirrorStreamId(targetTabId, consumerTabId) {
+  const options = { targetTabId };
+  if (consumerTabId !== undefined) {
+    options.consumerTabId = consumerTabId;
+  }
+
+  return chrome.tabCapture.getMediaStreamId(options);
+}
 
 async function startMirrorMode(tab, sendResponse) {
   try {
-    // Get a media stream ID for the target tab
-    // NOTE: getMediaStreamId is callback-based (no Promise version in MV3)
-    const streamId = await new Promise((resolve, reject) => {
-      chrome.tabCapture.getMediaStreamId(
-        { targetTabId: tab.id },
-        (id) => {
-          if (chrome.runtime.lastError) {
-            reject(new Error(chrome.runtime.lastError.message));
-          } else {
-            resolve(id);
-          }
-        }
-      );
-    });
+    // ── Prefer tab-hosted Document PiP for ALL origins when possible ──────────
+    // Document PiP windows are fully independent per-tab: each content script
+    // manages its own window, so any number of tabs can be floated concurrently.
+    //
+    // We fall back to the shared offscreen document only for insecure origins
+    // (http:// non-localhost) where the tab itself cannot consume the stream.
+    // NOTE: native video PiP (offscreen path) is subject to the browser's
+    // "one video PiP per browsing context" rule, so concurrent offscreen
+    // sessions on the same device will replace each other. Users on insecure
+    // origins should upgrade to HTTPS for full multi-tab support.
 
-    // Ensure the offscreen document exists (reuse if already open)
+    if (isSecureMirrorConsumerUrl(tab.url || "")) {
+      // Secure origin → use Document PiP inside the tab (fully concurrent)
+      const streamId = await getMirrorStreamId(tab.id, tab.id);
+
+      const response = await chrome.tabs.sendMessage(tab.id, {
+        type: "START_MIRROR_DOC_PIP",
+        streamId,
+        reuseExistingWindow: false,
+      });
+
+      if (!response?.success) {
+        throw new Error(response?.error || "Mirror Doc PiP failed");
+      }
+
+      pipRegistry.set(tab.id, { mode: "mirror", host: "tab" });
+      updateBadge();
+
+      sendResponse({ success: true, mode: "mirror", host: "tab" });
+      return;
+    }
+
+    // ── Insecure origin fallback: shared offscreen document ───────────────────
+    // Only one native video PiP can be open at a time on insecure origins.
+    // We still allow it so the feature works at all on http:// pages, but
+    // warn the user that it will replace any existing offscreen mirror.
+    const streamId = await getMirrorStreamId(tab.id);
+
+    // Ensure the shared offscreen document exists (reuse if already open)
     await ensureOffscreenDocument();
 
-    // Send the stream ID to offscreen.js to start capture and PiP
+    // Send the stream ID and tabId to offscreen.js so it can manage per-tab sessions.
+    // stopMirrorPiP for the previous tab (if any) is handled inside offscreen.js
+    // via the sessions Map, so each tab still gets its own tracked session.
     await chrome.runtime.sendMessage({
       type: "START_MIRROR_PIP",
       streamId,
       tabId: tab.id,
     });
 
-    pipState = { active: true, mode: "mirror", tabId: tab.id };
-    sendResponse({ success: true, mode: "mirror" });
+    // Register this tab in the registry
+    pipRegistry.set(tab.id, { mode: "mirror", host: "offscreen" });
+    updateBadge();
+
+    sendResponse({ success: true, mode: "mirror", host: "offscreen" });
   } catch (err) {
     console.error("[FloatTab SW] startMirrorMode error:", err);
     sendResponse({ success: false, error: err.message });

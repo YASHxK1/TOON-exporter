@@ -157,3 +157,4 @@ function stopMirrorPiP(tabId) {
 
   sessions.delete(tabId);
 }
+ 

@@ -57,7 +57,7 @@ That's it. No accounts, no signups, no configuration.
 
 ## Good to Know
 
-- **One float at a time.** You can have one floating window open. Opening a new one closes the previous.
+- **Multiple floats are supported on secure sites.** FloatTab can keep multiple tabs open at once when they use the per-tab Document PiP path. Some insecure-origin sites may still fall back to Chrome's older single-window mirror behavior.
 - **Chrome pages can't be floated.** The Settings page (`chrome://settings`), extensions page, and similar system pages can't be put into a floating window. That's a Chrome security restriction, not a bug.
 - **DRM protected content** (like Netflix or Disney+) will show a black screen in View Only mode. This is a browser level protection and can't be bypassed.
 - **Your data stays local.** FloatTab doesn't send any data anywhere. Everything happens right in your browser.

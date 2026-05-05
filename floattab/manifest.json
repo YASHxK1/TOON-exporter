@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "FloatTab",
-  "version": "1.0",
+  "version": "2.0",
   "description": "Open any website in an interactive floating Picture-in-Picture window. Click, scroll, and fill forms — without leaving your current tab.",
   "permissions": [
     "tabCapture",
